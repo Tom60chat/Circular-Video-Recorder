@@ -89,10 +89,12 @@ class _MyHomePageState extends State<MyHomePage> {
   int recordMins = initMins;
   int recordCount = initCount;
   ResolutionPreset resolutionPreset = ResolutionPreset.medium;
+  CameraDescription camera = _cameras[0];
   DateTime currentClipStart = DateTime.now();
   String? ip;
   bool saving = false;
   bool moving = false;
+  bool lockRecording = false;
   Directory? exportDir;
   var lenController = TextEditingController(text: initMins.toString());
   var countController = TextEditingController(text: initCount.toString());
@@ -106,7 +108,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> initCam() async {
-    cameraController = CameraController(_cameras[0], resolutionPreset);
+    cameraController = CameraController(camera, resolutionPreset);
     try {
       await cameraController.initialize();
       if (!mounted) {
@@ -131,6 +133,8 @@ class _MyHomePageState extends State<MyHomePage> {
     List<FileSystemEntity>? existingFiles = await saveDir?.list().toList();
     existingFiles?.removeWhere(
         (element) => element.uri.pathSegments.last == 'index.html');
+    existingFiles?.removeWhere(
+            (element) => element.uri.pathSegments.last == 'Lock');
     return existingFiles ?? [];
   }
 
@@ -149,7 +153,7 @@ class _MyHomePageState extends State<MyHomePage> {
       html += '<p>No Clips Found!</p>';
     }
     html += '</body></html>';
-    File('${saveDir!.path}/index.html').writeAsString(html);
+    //File('${saveDir!.path}/index.html').writeAsString(html); // Can't write after app close TODO: Update
   }
 
   @override
@@ -197,6 +201,16 @@ class _MyHomePageState extends State<MyHomePage> {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.start,
             children: <Widget>[
+              Flexible(
+                  child: Text(
+                    status ??
+                        'A count limit of 0 is infinite.\nLower the length/count in case of crashes.',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+                    overflow: TextOverflow.clip,
+                  )),
+              const SizedBox(width: 15),
               Expanded(
                   child: TextField(
                 controller: lenController,
@@ -230,27 +244,56 @@ class _MyHomePageState extends State<MyHomePage> {
                         border: OutlineInputBorder(),
                         labelText: 'Clip Count Limit',
                       ))),
-              const SizedBox(width: 15),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(15, 15, 15, 10),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.start,
+            children: <Widget>[
               Expanded(
                   child: DropdownButtonFormField(
                       value: resolutionPreset,
                       items: ResolutionPreset.values
                           .map((e) => DropdownMenuItem<ResolutionPreset>(
-                              value: e, child: Text(e.name)))
+                          value: e, child: Text(e.name)))
                           .toList(),
                       onChanged: cameraController.value.isRecordingVideo
                           ? null
                           : (value) {
-                              if (value != null) {
-                                setState(() {
-                                  resolutionPreset = value as ResolutionPreset;
-                                });
-                                initCam();
-                              }
-                            },
+                        if (value != null) {
+                          setState(() {
+                            resolutionPreset = value as ResolutionPreset;
+                          });
+                          initCam();
+                        }
+                      },
                       decoration: const InputDecoration(
                         border: OutlineInputBorder(),
                         labelText: 'Video Quality',
+                      ))),
+              const SizedBox(width: 15),
+              Expanded(
+                  child: DropdownButtonFormField(
+                      value: camera,
+                      items: _cameras
+                          .map((e) => DropdownMenuItem<CameraDescription>(
+                          value: e, child: Text(e.name)))
+                          .toList(),
+                      onChanged: cameraController.value.isRecordingVideo
+                          ? null
+                          : (value) {
+                        if (value != null) {
+                          setState(() {
+                            camera = value as CameraDescription;
+                          });
+                          initCam();
+                        }
+                      },
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        labelText: 'Camera',
                       ))),
             ],
           ),
@@ -260,18 +303,6 @@ class _MyHomePageState extends State<MyHomePage> {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Flexible(
-                  child: Text(
-                status ??
-                    'A count limit of 0 is infinite.\nLower the length/count in case of crashes.',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                overflow: TextOverflow.clip,
-              )),
-              const SizedBox(
-                width: 15,
-              ),
               ElevatedButton.icon(
                   label: Text(cameraController.value.isRecordingVideo
                       ? 'Stop'
@@ -297,6 +328,14 @@ class _MyHomePageState extends State<MyHomePage> {
                   icon: Icon(cameraController.value.isRecordingVideo
                       ? Icons.stop
                       : Icons.circle)),
+              const SizedBox(width: 15),
+              if (cameraController.value.isRecordingVideo)
+                ElevatedButton.icon(
+                    label: Text(lockRecording ? 'Locked' : 'Lock'),
+                    onPressed: () => setState(() {
+                      lockRecording = true;
+                    }),
+                    icon: Icon(lockRecording ? Icons.lock : Icons.lock_open)),
             ],
           ),
         ),
@@ -366,17 +405,44 @@ class _MyHomePageState extends State<MyHomePage> {
       setState(() {
         saving = true;
       });
-      tempFile.saveTo(filePath).then((_) {
+      tempFile.saveTo(filePath).then((_) async {
         File(tempFile.path).delete();
         generateHTMLList();
         setState(() {
           saving = false;
         });
+        if (lockRecording) {
+          await lockOldRecordings();
+        }
         if (cleanup) {
           deleteOldRecordings();
         }
       });
     }
+  }
+
+  /// Locks the oldest clips so they are not deleted.
+  /// This move all existing clips to the Lock folder.
+  Future<void> lockOldRecordings() async {
+    List<FileSystemEntity> existingClips = await getExistingClips();
+
+    if (existingClips.isNotEmpty) {
+      setState(() {
+        moving = true;
+      });
+      Directory lockDir = Directory('${saveDir!.path}/Lock');
+      lockDir.createSync(recursive: true);
+      await Future.wait(existingClips.map((eC) {
+        showInSnackBar('Moving: ${eC.uri.pathSegments.last}');
+        return eC.rename('${lockDir.path}/${eC.uri.pathSegments.last}');
+      }));
+      generateHTMLList();
+      setState(() {
+        moving = false;
+      });
+    }
+
+    lockRecording = false;
   }
 
   Future<bool> deleteOldRecordings() async {
@@ -385,6 +451,8 @@ class _MyHomePageState extends State<MyHomePage> {
       List<FileSystemEntity> existingClips = await getExistingClips();
       if (existingClips.length > recordCount) {
         ret = true;
+        existingClips.sort((b, a) =>
+            a.uri.pathSegments.last.compareTo(b.uri.pathSegments.last));
         await Future.wait(existingClips.sublist(recordCount).map((eC) {
           showInSnackBar(
               'Clip limit reached. Deleting: ${eC.uri.pathSegments.last}');
